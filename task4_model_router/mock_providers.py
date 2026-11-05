@@ -13,7 +13,12 @@
   stream_error_first SSE: role chunk, then an in-stream {"error": ...} before any content
   list_no_usage      JSON: list-valued content and no usage block
 
-Run: uv run uvicorn --factory task4_model_router.mock_providers:app_factory --port 8401
+Control it at runtime (so failover can be triggered by hand, not only from tests):
+  curl -X POST localhost:8401/_mock/mode -d '{"mode":"rate_limited","retry_after":"30"}'
+  curl localhost:8401/_mock/stats          # {"mode": ..., "calls": N, ...}
+  or per request: header ``x-mock-mode: slow`` (+ ``x-mock-delay-s: 5``)
+
+Run: MOCK_PROVIDER_NAME=primary uv run uvicorn --factory task4_model_router.mock_providers:app_factory --port 8401
 """
 
 from __future__ import annotations
@@ -28,7 +33,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 LEAKY_BODY = {
     "error": {
-        "message": "Traceback (most recent call last): File \"/opt/provider/internal/shard_router.py\", line 88 ... "
+        "message": 'Traceback (most recent call last): File "/opt/provider/internal/shard_router.py", line 88 ... '
         "KeyError: org-SECRET-123 api_key=sk-live-SUPERSECRET",
         "type": "server_error",
     }
@@ -44,8 +49,9 @@ def build(name: str) -> tuple[FastAPI, dict[str, Any]]:
         body = await request.json()
         state["calls"] += 1
         state["last_body"] = body
-        mode = state["mode"]
-        text = f"Hello from {name}"
+        mode = request.headers.get("x-mock-mode") or state["mode"]
+        delay_s = float(request.headers.get("x-mock-delay-s") or state["delay_s"])
+        text = f"Hello from {state['name']}"
         prompt_tokens, completion_tokens = 20, 5
 
         if mode == "rate_limited":
@@ -55,25 +61,48 @@ def build(name: str) -> tuple[FastAPI, dict[str, Any]]:
         if mode == "bad_request":
             return JSONResponse(LEAKY_BODY, status_code=400)
         if mode == "slow":
-            await asyncio.sleep(state["delay_s"])
+            await asyncio.sleep(delay_s)
         if mode == "trickle":
+
             async def trickle():
                 for _ in range(20):
                     yield b" "
                     await asyncio.sleep(0.5)
+
             return StreamingResponse(trickle(), media_type="application/json")
 
         base = {"id": f"chatcmpl-{name}", "created": int(time.time()), "model": body.get("model") or name}
-        usage = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens}
+        usage = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
 
         if not body.get("stream"):
             if mode == "list_no_usage":
-                return JSONResponse({**base, "object": "chat.completion", "choices": [
-                    {"index": 0, "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
-                     "finish_reason": "stop"}]})
-            return JSONResponse({**base, "object": "chat.completion", "choices": [
-                {"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}
-            ], "usage": usage})
+                return JSONResponse(
+                    {
+                        **base,
+                        "object": "chat.completion",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    }
+                )
+            return JSONResponse(
+                {
+                    **base,
+                    "object": "chat.completion",
+                    "choices": [
+                        {"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}
+                    ],
+                    "usage": usage,
+                }
+            )
 
         def frame(obj: dict) -> bytes:
             return f"data: {json.dumps(obj)}\n\n".encode()
@@ -83,14 +112,21 @@ def build(name: str) -> tuple[FastAPI, dict[str, Any]]:
             if mode == "stream_bad_bytes":
                 yield b"data: \xff\xfe\n\n"
                 return
-            yield frame({**chunk, "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]})
+            yield frame(
+                {
+                    **chunk,
+                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
+                }
+            )
             if mode == "stream_error_first":
                 yield frame({"error": {"message": "internal: model shard 3 crashed", "type": "server_error"}})
                 return
             if mode == "stream_slow_first":
-                await asyncio.sleep(state["delay_s"])
+                await asyncio.sleep(delay_s)
             for word in text.split(" "):
-                yield frame({**chunk, "choices": [{"index": 0, "delta": {"content": word + " "}, "finish_reason": None}]})
+                yield frame(
+                    {**chunk, "choices": [{"index": 0, "delta": {"content": word + " "}, "finish_reason": None}]}
+                )
                 if mode == "stream_break":
                     raise RuntimeError("connection lost")  # uvicorn aborts the response mid-stream
             yield frame({**chunk, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
@@ -99,6 +135,18 @@ def build(name: str) -> tuple[FastAPI, dict[str, Any]]:
             yield b"data: [DONE]\n\n"
 
         return StreamingResponse(gen(), media_type="text/event-stream")
+
+    @app.post("/_mock/mode")
+    async def set_mode(request: Request) -> dict[str, Any]:
+        update = await request.json()
+        for key in ("mode", "delay_s", "retry_after"):
+            if key in update:
+                state[key] = update[key]
+        return {k: v for k, v in state.items() if k != "last_body"}
+
+    @app.get("/_mock/stats")
+    async def stats() -> dict[str, Any]:
+        return {k: v for k, v in state.items() if k != "last_body"}
 
     return app, state
 

@@ -239,7 +239,7 @@ class ModelRouter:
         for provider in order:
             t0 = time.perf_counter()
 
-            def done(outcome: str) -> None:
+            def done(outcome: str, provider: Provider = provider, t0: float = t0) -> None:
                 attempts.append(Attempt(provider.name, outcome, round((time.perf_counter() - t0) * 1000, 1)))
 
             try:
@@ -250,7 +250,9 @@ class ModelRouter:
             except TimeoutError:
                 self.breaker.record_failure(provider.name)
                 done("timeout")
-                logger.warning("rid=%s provider=%s deadline %.0fms exceeded", rid, provider.name, provider.timeout_s * 1000)
+                logger.warning(
+                    "rid=%s provider=%s deadline %.0fms exceeded", rid, provider.name, provider.timeout_s * 1000
+                )
                 continue
             except httpx.HTTPError as exc:
                 self.breaker.record_failure(provider.name)
@@ -291,7 +293,7 @@ class ModelRouter:
         for provider in order:
             t0 = time.perf_counter()
 
-            def done(outcome: str) -> None:
+            def done(outcome: str, provider: Provider = provider, t0: float = t0) -> None:
                 attempts.append(Attempt(provider.name, outcome, round((time.perf_counter() - t0) * 1000, 1)))
 
             payload = self._payload(provider, body)
@@ -335,7 +337,9 @@ class ModelRouter:
                     await resp.aclose()
                 self.breaker.record_failure(provider.name)
                 done("timeout")
-                logger.warning("rid=%s provider=%s no first token within %.0fms", rid, provider.name, provider.timeout_s * 1000)
+                logger.warning(
+                    "rid=%s provider=%s no first token within %.0fms", rid, provider.name, provider.timeout_s * 1000
+                )
                 continue
             except (httpx.HTTPError, StopAsyncIteration):
                 if resp is not None:
@@ -411,4 +415,10 @@ async def _continue_stream(prefetched, raw_iter, decoder, rid: str, provider: st
                     return
     except Exception:  # transport errors *and* decode errors (bad UTF-8, oversized event) after commit
         logger.warning("rid=%s provider=%s stream broke after first token", rid, provider, exc_info=True)
-        yield {"error": {"message": "Upstream stream interrupted", "type": "upstream_error", "code": "upstream_stream_interrupted"}}
+        yield {
+            "error": {
+                "message": "Upstream stream interrupted",
+                "type": "upstream_error",
+                "code": "upstream_stream_interrupted",
+            }
+        }

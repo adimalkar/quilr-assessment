@@ -24,8 +24,9 @@ INVALID_PARAMS, INVALID_REQUEST, PARSE_ERROR, METHOD_NOT_FOUND = -32602, -32600,
 
 
 class StdioHarness:
-    def __init__(self, extra_code: str = "") -> None:
-        bootstrap = textwrap.dedent(extra_code) + "\nfrom task1_mcp_server.server import main\nmain()\n"
+    def __init__(self, extra_code: str = "", module: str = "task1_mcp_server") -> None:
+        # Run the real entry point (`python -m <module>`) after any injected test code.
+        bootstrap = textwrap.dedent(extra_code) + f"\nimport runpy\nrunpy.run_module({module!r}, run_name='__main__')\n"
         self.proc = subprocess.Popen(
             [sys.executable, "-c", bootstrap],
             cwd=ROOT,
@@ -74,6 +75,25 @@ class StdioHarness:
         self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         return resp
 
+    def initialize_raw_tolerant(self) -> None:
+        """Handshake that skips non-JSON stdout lines (used only by the negative-control test)."""
+        self.send(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": {"name": "t", "version": "1"},
+                },
+            }
+        )
+        while True:
+            line = self._lines.get(timeout=5)
+            if line.startswith(b"{"):
+                return
+
     def call(self, name: str, arguments: dict | None) -> dict:
         params: dict = {"name": name}
         if arguments is not None:
@@ -114,7 +134,8 @@ def test_tools_list_schema_generated_from_pydantic(server):
     assert refund["additionalProperties"] is False
     assert refund["properties"]["amount"]["exclusiveMinimum"] == 0
     assert refund["properties"]["reason"]["minLength"] == 10
-    assert set(refund["required"]) == set(TriggerRefundInput.model_fields)
+    assert set(refund["required"]) == {"customer_id", "amount", "reason"}  # idempotency_key is optional
+    assert set(refund["properties"]) == set(TriggerRefundInput.model_fields)
 
 
 def test_get_customer_record_ok(server):
@@ -143,9 +164,20 @@ def test_unknown_customer_is_tool_execution_error(server):
 # --------------------------------------------------------------------------- validation -> -32602
 @pytest.mark.parametrize(
     "customer_id",
-    ["CUST-1234", "CUST-123456", "cust-12345", "CUST_12345", " CUST-12345", "CUST-12345\n", "CUST-1234a",
-     "CUST-١٢٣٤٥",  # Arabic-Indic digits must not satisfy [0-9]
-     "", 12345, None, ["CUST-12345"]],
+    [
+        "CUST-1234",
+        "CUST-123456",
+        "cust-12345",
+        "CUST_12345",
+        " CUST-12345",
+        "CUST-12345\n",
+        "CUST-1234a",
+        "CUST-١٢٣٤٥",  # Arabic-Indic digits must not satisfy [0-9]
+        "",
+        12345,
+        None,
+        ["CUST-12345"],
+    ],
 )
 def test_customer_id_format_rejected(server, customer_id):
     resp = server.call("get_customer_record", {"customer_id": customer_id})
@@ -248,7 +280,13 @@ def test_stray_prints_never_reach_stdout():
     stderr = h.close()
     h.assert_stdout_pure()
     assert all(b"ROGUE" not in line for line in h.raw_stdout)
-    for marker in ("ROGUE print()", "ROGUE sys.stdout.write", "ROGUE os.write(1)", "ROGUE child process", "ROGUE logging"):
+    for marker in (
+        "ROGUE print()",
+        "ROGUE sys.stdout.write",
+        "ROGUE os.write(1)",
+        "ROGUE child process",
+        "ROGUE logging",
+    ):
         assert marker in stderr, f"{marker!r} should have been diverted to stderr"
 
 
@@ -258,7 +296,7 @@ async def test_official_sdk_client_interop():
     from mcp.client.stdio import stdio_client
     from mcp.shared.exceptions import MCPError
 
-    params = StdioServerParameters(command=sys.executable, args=["-m", "task1_mcp_server.server"], cwd=str(ROOT))
+    params = StdioServerParameters(command=sys.executable, args=["-m", "task1_mcp_server"], cwd=str(ROOT))
     with open(os.devnull, "w") as errlog:
         async with stdio_client(params, errlog=errlog) as (read, write), ClientSession(read, write) as session:
             await session.initialize()
@@ -317,7 +355,9 @@ def test_modern_protocol_discover_path():
     disc = h.request("server/discover", {"_meta": meta})
     assert "2026-07-28" in disc["result"]["supportedVersions"]
     bad = h.request("tools/call", {"name": "get_customer_record", "arguments": {"customer_id": "x"}, "_meta": meta})
-    good = h.request("tools/call", {"name": "get_customer_record", "arguments": {"customer_id": "CUST-10001"}, "_meta": meta})
+    good = h.request(
+        "tools/call", {"name": "get_customer_record", "arguments": {"customer_id": "CUST-10001"}, "_meta": meta}
+    )
     h.close()
     h.assert_stdout_pure()
     assert bad["error"]["code"] == INVALID_PARAMS
@@ -353,8 +393,10 @@ def test_lone_surrogates_rejected_and_server_survives(server, frame):
 
 @pytest.mark.parametrize("bad_id", ["true", "1.0", "{}", "null", "[1]"])
 def test_invalid_request_ids_get_an_error_not_silence(server, bad_id):
-    server.send_raw('{"jsonrpc":"2.0","id":%s,"method":"tools/call","params":{"name":"trigger_refund","arguments":'
-                    '{"customer_id":"CUST-10001","amount":1.0,"reason":"should never execute"}}}' % bad_id)
+    server.send_raw(
+        '{"jsonrpc":"2.0","id":%s,"method":"tools/call","params":{"name":"trigger_refund","arguments":'
+        '{"customer_id":"CUST-10001","amount":1.0,"reason":"should never execute"}}}' % bad_id
+    )
     assert server.recv()["error"]["code"] == INVALID_REQUEST
     # and the refund must not have happened
     rec = server.call("get_customer_record", {"customer_id": "CUST-10001"})["result"]["structuredContent"]
@@ -389,3 +431,60 @@ def test_bad_log_level_does_not_crash():
     h.initialize()
     assert h.request("ping")["result"] == {}
     h.close()
+
+
+# --------------------------------------------------------------------------- iteration 4 (peer benchmark)
+def test_idempotency_key_prevents_double_refund(server):
+    args = {
+        "customer_id": "CUST-10003",
+        "amount": 100.0,
+        "reason": "Duplicate charge on invoice 7",
+        "idempotency_key": "refund-abc12345",
+    }
+    first = server.call("trigger_refund", args)["result"]["structuredContent"]
+    retry = server.call("trigger_refund", args)["result"]["structuredContent"]
+    assert first["refund_id"] == retry["refund_id"] and retry["replayed"] is True and first["replayed"] is False
+    rec = server.call("get_customer_record", {"customer_id": "CUST-10003"})["result"]["structuredContent"]
+    assert rec["refunded_total"] == 100.0  # charged once
+    conflict = server.call("trigger_refund", {**args, "amount": 5.0})["result"]
+    assert conflict["isError"] is True and "different arguments" in conflict["content"][0]["text"]
+
+
+@pytest.mark.parametrize("key", ["short", "x" * 65, "has space!", ""])
+def test_idempotency_key_format_validated(server, key):
+    args = {
+        "customer_id": "CUST-10003",
+        "amount": 1.0,
+        "reason": "Duplicate charge on invoice 7",
+        "idempotency_key": key,
+    }
+    assert server.call("trigger_refund", args)["error"]["code"] == INVALID_PARAMS
+
+
+NOISY_DEPENDENCY = """
+import importlib.abc, sys
+class _Noisy(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path, target=None):
+        if name == "pydantic":
+            print("ROGUE import-time print from a dependency")
+        return None
+sys.meta_path.insert(0, _Noisy())
+"""
+
+
+def test_import_time_prints_cannot_reach_the_wire():
+    """`python -m task1_mcp_server` claims fd 1 before importing any third-party package."""
+    h = StdioHarness(NOISY_DEPENDENCY, module="task1_mcp_server")
+    h.initialize()
+    stderr = h.close()
+    h.assert_stdout_pure()
+    assert "ROGUE import-time print" in stderr
+
+
+def test_negative_control_purity_check_can_fail():
+    """Negative control: importing the server module *before* claiming the wire lets the rogue print
+    through - proving the purity assertion above is capable of failing."""
+    h = StdioHarness(NOISY_DEPENDENCY, module="task1_mcp_server.server")
+    h.initialize_raw_tolerant()
+    h.close()
+    assert any(b"ROGUE" in line for line in h.raw_stdout)

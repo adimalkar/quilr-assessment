@@ -79,9 +79,8 @@ def _recover_id(payload: Any) -> str | int | None:
 
 @asynccontextmanager
 async def jsonrpc_stdio(wire_in: BinaryIO, wire_out: BinaryIO) -> AsyncIterator[tuple[Any, Any]]:
-    # Binary in: we decode each line strictly ourselves so invalid UTF-8 becomes a parse error
-    # instead of being silently "repaired" with U+FFFD and executed.
-    stdin = anyio.wrap_file(wire_in)
+    # Binary in (read via bounded readline in read_frame): we decode each line strictly ourselves so
+    # invalid UTF-8 becomes a parse error instead of being silently "repaired" with U+FFFD and executed.
     stdout = anyio.wrap_file(io.TextIOWrapper(wire_out, encoding="utf-8", newline="\n"))
     write_lock = anyio.Lock()
     peer_gone = anyio.Event()
@@ -156,7 +155,9 @@ async def jsonrpc_stdio(wire_in: BinaryIO, wire_out: BinaryIO) -> AsyncIterator[
                     if isinstance(message, types.JSONRPCNotification) and isinstance(payload, dict) and "id" in payload:
                         # e.g. "id": true / 1.0 / {} / null: the SDK would treat it as a notification and the
                         # caller would wait forever. MCP requires string/integer, non-null ids.
-                        await emit(_error_frame(types.INVALID_REQUEST, "Invalid Request: id must be a string or integer"))
+                        await emit(
+                            _error_frame(types.INVALID_REQUEST, "Invalid Request: id must be a string or integer")
+                        )
                         continue
                     await read_writer.send(SessionMessage(message))
         except anyio.ClosedResourceError:  # pragma: no cover - shutdown race
@@ -173,7 +174,11 @@ async def jsonrpc_stdio(wire_in: BinaryIO, wire_out: BinaryIO) -> AsyncIterator[
                         # Never let one unserialisable response kill the server or corrupt the wire.
                         logger.exception("failed to serialise outbound message")
                         rid = getattr(msg, "id", None)
-                        frame = _error_frame(types.INTERNAL_ERROR, "Internal error", rid if _recover_id({"id": rid}) is not None else None)
+                        frame = _error_frame(
+                            types.INTERNAL_ERROR,
+                            "Internal error",
+                            rid if _recover_id({"id": rid}) is not None else None,
+                        )
                     await emit(frame)
         except anyio.ClosedResourceError:  # pragma: no cover - shutdown race
             await anyio.lowlevel.checkpoint()

@@ -108,9 +108,12 @@ def smuggling_problem(msg: dict[str, Any]) -> str | None:
     if bad := _case_variant(msg.keys(), _RESERVED_TOP_LEVEL):
         return f"ambiguous key {bad!r}"
     params = msg.get("params")
-    if msg.get("method") == "tools/call" and isinstance(params, dict):
-        if bad := _case_variant(params.keys(), _RESERVED_TOOL_CALL):
-            return f"ambiguous key params.{bad}"
+    if (
+        msg.get("method") == "tools/call"
+        and isinstance(params, dict)
+        and (bad := _case_variant(params.keys(), _RESERVED_TOOL_CALL))
+    ):
+        return f"ambiguous key params.{bad}"
     return None
 
 

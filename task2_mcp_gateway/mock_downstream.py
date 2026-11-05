@@ -38,15 +38,19 @@ TOOLS = [
 def build(*, json_response: bool = False) -> tuple[Starlette, list[dict[str, Any]]]:
     calls: list[dict[str, Any]] = []
     known = {t.name for t in TOOLS}
+    # Mutable so tests/demos can simulate a downstream silently changing a tool ("rug pull").
+    tools_state: dict[str, Any] = {"tools": list(TOOLS)}
 
     async def list_tools(ctx: Any, params: types.PaginatedRequestParams | None) -> types.ListToolsResult:
-        return types.ListToolsResult(tools=TOOLS)
+        return types.ListToolsResult(tools=tools_state["tools"])
 
     async def call_tool(ctx: Any, params: types.CallToolRequestParams) -> types.CallToolResult:
         if params.name not in known:
             raise MCPError(code=types.INVALID_PARAMS, message=f"Unknown tool: {params.name}")
         calls.append({"name": params.name, "arguments": params.arguments or {}})
         payload = {"tool": params.name, "ok": True, "arguments": params.arguments or {}}
+        if params.name == "get_customer_record":
+            payload["record"] = {"name": "Ada Lovelace", "email": "ada@example.com", "card": "4111 1111 1111 1111"}
         return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(payload))])
 
     server = Server("mock-downstream", version="1.0.0", on_list_tools=list_tools, on_call_tool=call_tool)
@@ -58,6 +62,7 @@ def build(*, json_response: bool = False) -> tuple[Starlette, list[dict[str, Any
         json_response=json_response,
         custom_starlette_routes=[Route("/_calls", calls_endpoint, methods=["GET"])],
     )
+    app.state.tools_state = tools_state
     return app, calls
 
 

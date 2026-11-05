@@ -106,6 +106,7 @@ class SQLiteTokenLimiter:
         tokens_per_window: int = 50_000,
         window_ms: int = 60_000,
         clock: Callable[[], float] = time.time,
+        busy_timeout_ms: int = 5000,
     ) -> None:
         self.db_path = str(db_path)
         self.default_limit = tokens_per_window
@@ -114,10 +115,12 @@ class SQLiteTokenLimiter:
         # One connection guarded by a lock: sqlite3 objects aren't safe for concurrent use,
         # and statements here take microseconds. Cross-process safety comes from BEGIN IMMEDIATE.
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(self.db_path, timeout=5.0, isolation_level=None, check_same_thread=False)
+        self._conn = sqlite3.connect(
+            self.db_path, timeout=busy_timeout_ms / 1000, isolation_level=None, check_same_thread=False
+        )
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")  # durable across app crashes; WAL-safe
-        self._conn.execute("PRAGMA busy_timeout=5000")
+        self._conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
         self._conn.executescript(SCHEMA)
 
     # ------------------------------------------------------------------ time
@@ -156,7 +159,9 @@ class SQLiteTokenLimiter:
         reset = (rows[0][0] + self.window_ms - now) if rows else 0
         return WindowState(limit=limit, used=used, reset_ms=max(0, reset)), rows
 
-    def reserve_sync(self, key_hash: str, tokens: int, limit: int | None = None, request_id: str | None = None) -> Reservation | RateLimited:
+    def reserve_sync(
+        self, key_hash: str, tokens: int, limit: int | None = None, request_id: str | None = None
+    ) -> Reservation | RateLimited:
         limit = limit or self.default_limit
         if tokens > limit:
             raise RequestTooLarge(tokens, limit)

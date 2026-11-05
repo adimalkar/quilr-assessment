@@ -110,7 +110,9 @@ class ChunkGuard:
     def process(self, chunk: dict[str, Any]) -> dict[str, Any] | None:
         """Return the chunk to emit (redacted), or None to suppress it."""
         self.stats.chunks_in += 1
-        self._last_envelope = {k: chunk[k] for k in ("id", "object", "created", "model", "system_fingerprint") if k in chunk}
+        self._last_envelope = {
+            k: chunk[k] for k in ("id", "object", "created", "model", "system_fingerprint") if k in chunk
+        }
         keep = bool(chunk.get("usage"))
         new_choices = []
         for pos, choice in enumerate(chunk.get("choices") or []):

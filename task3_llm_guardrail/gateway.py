@@ -29,13 +29,12 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from .sse import SSEDecoder, encode_event
+from .sse import SSEDecoder, encode_event, with_heartbeat
 from .stream_guard import ChunkGuard, redact_completion
 
 logger = logging.getLogger("task3.guardrail")
@@ -49,12 +48,15 @@ class GuardSettings:
     # Max gap between upstream chunks (httpx `read` is per-read, not total) - a stalled provider is cut off.
     read_timeout: float = 60.0
     max_body_bytes: int = 2_000_000
+    # Idle gap after which an SSE ": ping" comment is sent (keeps proxies/LBs from cutting quiet streams).
+    heartbeat_s: float | None = 15.0
 
     @classmethod
     def from_env(cls) -> GuardSettings:
         return cls(
             upstream_base_url=os.environ.get("GUARD_UPSTREAM_BASE_URL", cls.upstream_base_url),
             upstream_api_key=os.environ.get("GUARD_UPSTREAM_API_KEY"),
+            heartbeat_s=float(os.environ.get("GUARD_HEARTBEAT_S", 15.0)) or None,
         )
 
 
@@ -127,7 +129,9 @@ def create_app(settings: GuardSettings, *, transport: httpx.AsyncBaseTransport |
             logger.warning("rid=%s upstream status %s", rid, upstream.status_code)
             # 401/403 from the provider are the *gateway's* credential problem, not the client's: 502.
             status = upstream.status_code if upstream.status_code in (400, 404, 413, 422, 429) else 502
-            return _error(status, "Upstream provider returned an error", "upstream_error", f"upstream_{upstream.status_code}", rid)
+            return _error(
+                status, "Upstream provider returned an error", "upstream_error", f"upstream_{upstream.status_code}", rid
+            )
 
         if not stream:
             try:
@@ -142,7 +146,7 @@ def create_app(settings: GuardSettings, *, transport: httpx.AsyncBaseTransport |
             return JSONResponse(data, headers={"x-request-id": rid, "x-guardrail-redactions": str(count)})
 
         return StreamingResponse(
-            _guarded_stream(upstream, rid, t0),
+            with_heartbeat(_guarded_stream(upstream, rid, t0), settings.heartbeat_s),
             media_type="text/event-stream",
             headers={"cache-control": "no-cache", "x-accel-buffering": "no", "x-request-id": rid},
         )
@@ -201,11 +205,17 @@ async def _guarded_stream(upstream: httpx.Response, rid: str, t0: float) -> Asyn
         s = guard.stats
         logger.info(
             "rid=%s stream closed redactions=%d max_buffered_chars=%d chunks_in=%d chunks_out=%d ttft_ms=%s",
-            rid, s.redactions, s.max_buffered, s.chunks_in, s.chunks_out,
+            rid,
+            s.redactions,
+            s.max_buffered,
+            s.chunks_in,
+            s.chunks_out,
             f"{(first_out - t0) * 1000:.1f}" if first_out else "n/a",
         )
 
 
 def app_factory() -> FastAPI:
-    logging.basicConfig(level=os.environ.get("GUARD_LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(
+        level=os.environ.get("GUARD_LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
     return create_app(GuardSettings.from_env())

@@ -1,6 +1,6 @@
 """Task 1 - Customer-support MCP server over stdio with strict input validation.
 
-Run:   uv run python -m task1_mcp_server.server
+Run:   uv run python -m task1_mcp_server      (claims stdout before any third-party import)
 
 STDIO contract
 --------------
@@ -8,7 +8,7 @@ STDIO contract
 * Everything else - logging, warnings, stray ``print()``, output of C extensions
   or child processes - goes to fd 2 (stderr).
 
-This is enforced at the file-descriptor level in :func:`_claim_stdio`, not just by
+This is enforced at the file-descriptor level in :func:`stdio_guard.claim_stdio`, not just by
 "remembering not to print": the real stdout is duplicated onto a private fd that
 only the transport writer owns, and fd 1 is then re-pointed at stderr.
 
@@ -29,8 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-import sys
-from typing import Any, BinaryIO
+from typing import Any
 
 import anyio
 import mcp_types as types
@@ -47,6 +46,7 @@ from .schemas import (
     RefundReceipt,
     TriggerRefundInput,
 )
+from .stdio_guard import claim_stdio, configure_logging
 from .transport import jsonrpc_stdio
 
 logger = logging.getLogger("task1.mcp_server")
@@ -58,39 +58,6 @@ SERVER_VERSION = "1.0.0"
 # --------------------------------------------------------------------------- #
 # STDIO isolation
 # --------------------------------------------------------------------------- #
-def _configure_logging() -> None:
-    level = os.environ.get("MCP_LOG_LEVEL", "INFO").upper()
-    if level not in logging.getLevelNamesMapping():
-        level = "INFO"  # a typo in config must not take the server down
-    logging.basicConfig(
-        level=level,
-        stream=sys.stderr,  # never stdout
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        force=True,
-    )
-    logging.captureWarnings(True)
-
-
-def _claim_stdio() -> tuple[BinaryIO, BinaryIO]:
-    """Reserve the real stdout for JSON-RPC and divert everything else to stderr.
-
-    Returns binary handles for the wire (stdin, stdout).
-    """
-    sys.stdout.flush()
-    # Private duplicate of the real stdout; os.dup() fds are non-inheritable, so
-    # child processes cannot write onto the wire either.
-    wire_out_fd = os.dup(1)
-    # fd 1 now *is* stderr: print(), C-level printf(), subprocess output all land there.
-    os.dup2(2, 1)
-    sys.stdout = sys.stderr  # Python-level belt-and-braces
-
-    wire_in_fd = os.dup(0)
-    devnull = os.open(os.devnull, os.O_RDONLY)
-    os.dup2(devnull, 0)  # nothing else may consume bytes meant for the JSON-RPC reader
-    os.close(devnull)
-    return os.fdopen(wire_in_fd, "rb"), os.fdopen(wire_out_fd, "wb")
-
-
 # --------------------------------------------------------------------------- #
 # Tool definitions
 # --------------------------------------------------------------------------- #
@@ -208,21 +175,32 @@ def build_server(store: CustomerStore | None = None, *, validation_errors: str |
                 return _ok(CustomerRecord(**customer.to_public_dict()))
 
             if isinstance(args, TriggerRefundInput):
-                try:
+
+                def issue() -> dict[str, Any]:
                     refund_id, customer = store.refund(args.customer_id, args.amount)
-                except (LookupError, ValueError) as exc:
-                    return _tool_error(str(exc))
-                logger.info("refund %s issued for %s amount=%.2f", refund_id, customer.customer_id, args.amount)
-                return _ok(
-                    RefundReceipt(
+                    logger.info("refund %s issued for %s amount=%.2f", refund_id, customer.customer_id, args.amount)
+                    return RefundReceipt(
                         refund_id=refund_id,
                         customer_id=customer.customer_id,
                         amount=args.amount,
                         reason=args.reason,
                         status="processed",
                         remaining_refundable_balance=customer.refundable_balance,
-                    )
-                )
+                        idempotency_key=args.idempotency_key,
+                    ).model_dump()
+
+                try:
+                    if args.idempotency_key is None:
+                        receipt = issue()
+                    else:
+                        fingerprint = (args.customer_id, args.amount, args.reason)
+                        receipt, replayed = store.idempotent(args.idempotency_key, fingerprint, issue)
+                        receipt = {**receipt, "replayed": replayed}
+                except (LookupError, ValueError) as exc:
+                    if isinstance(exc, KeyError):
+                        return _tool_error("idempotency_key was already used with different arguments")
+                    return _tool_error(str(exc))
+                return _ok(RefundReceipt(**receipt))
         except Exception:
             # Full traceback to stderr only; the client gets a generic, non-leaky error.
             logger.exception("unhandled error in tool %s", name)
@@ -240,7 +218,7 @@ def build_server(store: CustomerStore | None = None, *, validation_errors: str |
 
 
 async def _serve() -> None:
-    wire_in, wire_out = _claim_stdio()
+    wire_in, wire_out = claim_stdio()  # no-op if __main__ already claimed it
     server = build_server()
     logger.info("%s v%s listening on stdio", SERVER_NAME, SERVER_VERSION)
     async with jsonrpc_stdio(wire_in, wire_out) as (read_stream, write_stream):
@@ -249,7 +227,7 @@ async def _serve() -> None:
 
 
 def main() -> None:
-    _configure_logging()
+    configure_logging()
     try:
         anyio.run(_serve)
     except KeyboardInterrupt:

@@ -113,3 +113,61 @@ def encode_event(data: str, event: str | None = None) -> bytes:
         out.append(f"event: {event}")
     out.extend(f"data: {line}" for line in data.split("\n"))
     return ("\n".join(out) + "\n\n").encode()
+
+
+HEARTBEAT = b": ping\n\n"
+
+
+async def with_heartbeat(source, interval: float | None, ping: bytes = HEARTBEAT):
+    """Re-yield ``source`` (an async iterator of bytes), inserting an SSE comment line whenever it has
+    been idle for ``interval`` seconds.
+
+    Corporate egress proxies, load balancers and NATs commonly drop connections idle for 30-120 s; a
+    model "thinking" before its first token, or a long tool call, looks exactly like that. SSE comments
+    are ignored by every client but keep the connection alive. The source is read by a separate task
+    feeding a queue, so a timeout never cancels an in-flight socket read; closing this generator (client
+    disconnect) cancels that task and closes the source, which still propagates cancellation upstream.
+    """
+    import asyncio
+
+    import anyio
+
+    if not interval:
+        async for item in source:
+            yield item
+        return
+    queue: asyncio.Queue = asyncio.Queue(maxsize=16)  # small: backpressure reaches the upstream read
+    done = object()
+
+    async def pump():
+        try:
+            async for item in source:
+                await queue.put(item)
+            await queue.put(done)
+        except BaseException as exc:
+            await queue.put(exc)
+
+    task = asyncio.create_task(pump())
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), interval)
+            except TimeoutError:
+                yield ping
+                continue
+            if item is done:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+    finally:
+        # Shielded: ASGI servers cancel via anyio cancel scopes, which re-raise CancelledError at *every*
+        # await inside the cancelled scope. Unshielded, this cleanup would be cut short and the upstream
+        # connection would stay open (the provider keeps generating and billing). Cancelling the pump
+        # throws CancelledError into ``source`` at its pending read, so its own ``finally`` closes upstream.
+        with anyio.CancelScope(shield=True):
+            task.cancel()
+            try:
+                await task
+            except BaseException:
+                pass

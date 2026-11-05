@@ -29,11 +29,26 @@ class Customer:
 @dataclass
 class CustomerStore:
     customers: dict[str, Customer] = field(default_factory=dict)
-    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     _refund_seq: itertools.count = field(default_factory=lambda: itertools.count(1), repr=False)
+    # idempotency_key -> (fingerprint of the arguments, stored receipt dict)
+    _idempotency: dict[str, tuple[tuple, dict]] = field(default_factory=dict, repr=False)
 
     def get(self, customer_id: str) -> Customer | None:
         return self.customers.get(customer_id)
+
+    def idempotent(self, key: str, fingerprint: tuple, make_receipt) -> tuple[dict, bool]:
+        """Run ``make_receipt`` at most once per key. Returns (receipt, replayed).
+        Raises KeyError if the key was already used with different arguments."""
+        with self._lock:  # re-entrant: refund() inside make_receipt takes it again
+            if key in self._idempotency:
+                seen_fp, receipt = self._idempotency[key]
+                if seen_fp != fingerprint:
+                    raise KeyError(key)
+                return receipt, True
+            receipt = make_receipt()  # check-and-issue is one critical section: no double refund
+            self._idempotency[key] = (fingerprint, receipt)
+            return receipt, False
 
     def refund(self, customer_id: str, amount: float) -> tuple[str, Customer]:
         """Apply a refund atomically. Raises LookupError / ValueError on business-rule violations."""

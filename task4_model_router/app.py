@@ -31,9 +31,12 @@ from typing import Any, Literal
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+from task3_llm_guardrail.sse import with_heartbeat
+from task3_llm_guardrail.stream_guard import ChunkGuard, redact_completion
 
 from .errors import GatewayError, error_body, install_error_handlers
 from .limiter import RateLimited, RequestTooLarge, SQLiteTokenLimiter, WindowState
@@ -67,7 +70,9 @@ def _output_chars(node: Any) -> int:
     if isinstance(node, str):
         return len(node)
     if isinstance(node, dict):
-        return sum(_output_chars(v) for k, v in node.items() if k not in ("role", "type", "id", "index", "finish_reason"))
+        return sum(
+            _output_chars(v) for k, v in node.items() if k not in ("role", "type", "id", "index", "finish_reason")
+        )
     if isinstance(node, list):
         return sum(_output_chars(v) for v in node)
     return 0
@@ -81,17 +86,25 @@ class RouterSettings:
     window_ms: int = 60_000
     default_max_tokens: int = 1024
     primary: Provider = field(default_factory=lambda: Provider("primary", "http://127.0.0.1:8401/v1", timeout_s=3.0))
-    secondary: Provider = field(default_factory=lambda: Provider("secondary", "http://127.0.0.1:8402/v1", timeout_s=10.0))
+    secondary: Provider = field(
+        default_factory=lambda: Provider("secondary", "http://127.0.0.1:8402/v1", timeout_s=10.0)
+    )
     tenants: list[tuple[str, str, int | None]] = field(default_factory=list)  # (api_key, name, tpm override)
     prune_interval_s: float = 30.0
     max_body_bytes: int = 4_000_000
+    # Compose Task 3 into Task 4: run every response through the streaming PII guardrail.
+    redact_pii: bool = False
+    sqlite_busy_timeout_ms: int = 2000  # bounded wait on a locked DB, then a fast 503 (never a hang)
+    heartbeat_s: float | None = 15.0
 
     @classmethod
     def from_env(cls) -> RouterSettings:
         tenants = []
         for spec in filter(None, os.environ.get("ROUTER_TENANTS", "").split(",")):
             parts = spec.split(":")
-            tenants.append((parts[0], parts[1] if len(parts) > 1 else parts[0][:8], int(parts[2]) if len(parts) > 2 else None))
+            tenants.append(
+                (parts[0], parts[1] if len(parts) > 1 else parts[0][:8], int(parts[2]) if len(parts) > 2 else None)
+            )
         return cls(
             db_path=os.environ.get("ROUTER_DB_PATH", cls.db_path),
             tokens_per_minute=int(os.environ.get("ROUTER_TPM", 50_000)),
@@ -110,6 +123,8 @@ class RouterSettings:
                 timeout_s=float(os.environ.get("ROUTER_SECONDARY_TIMEOUT_MS", 10000)) / 1000,
             ),
             tenants=tenants,
+            redact_pii=os.environ.get("ROUTER_REDACT_PII", "0").lower() in {"1", "true", "yes"},
+            heartbeat_s=float(os.environ.get("ROUTER_HEARTBEAT_S", 15.0)) or None,
         )
 
 
@@ -151,7 +166,11 @@ def create_app(
 ) -> FastAPI:
     Path(settings.db_path).parent.mkdir(parents=True, exist_ok=True)
     limiter = SQLiteTokenLimiter(
-        settings.db_path, tokens_per_window=settings.tokens_per_minute, window_ms=settings.window_ms, clock=clock
+        settings.db_path,
+        tokens_per_window=settings.tokens_per_minute,
+        window_ms=settings.window_ms,
+        clock=clock,
+        busy_timeout_ms=settings.sqlite_busy_timeout_ms,
     )
     for api_key, name, tpm in settings.tenants:
         limiter.add_tenant(api_key, name, tpm)
@@ -186,17 +205,29 @@ def create_app(
         auth = request.headers.get("authorization", "")
         scheme, _, key = auth.partition(" ")
         if scheme.lower() != "bearer" or not key.strip():
-            raise GatewayError(401, "authentication_error", "missing_api_key", "Provide your API key as 'Authorization: Bearer <key>'",
-                               headers={"www-authenticate": "Bearer"})
+            raise GatewayError(
+                401,
+                "authentication_error",
+                "missing_api_key",
+                "Provide your API key as 'Authorization: Bearer <key>'",
+                headers={"www-authenticate": "Bearer"},
+            )
         tenant = await asyncio.to_thread(limiter.tenant, key.strip())
         if tenant is None:
-            raise GatewayError(401, "authentication_error", "invalid_api_key", "Invalid API key", headers={"www-authenticate": "Bearer"})
+            raise GatewayError(
+                401,
+                "authentication_error",
+                "invalid_api_key",
+                "Invalid API key",
+                headers={"www-authenticate": "Bearer"},
+            )
         return tenant
 
     async def read_body(request: Request) -> bytes:
         declared = request.headers.get("content-length")
-        too_large = GatewayError(413, "invalid_request_error", "request_too_large",
-                                 f"Request body exceeds {settings.max_body_bytes} bytes")
+        too_large = GatewayError(
+            413, "invalid_request_error", "request_too_large", f"Request body exceeds {settings.max_body_bytes} bytes"
+        )
         if declared and declared.isdigit() and int(declared) > settings.max_body_bytes:
             raise too_large
         chunks, size = [], 0
@@ -229,16 +260,26 @@ def create_app(
         except RequestTooLarge as exc:
             # Non-retryable: no amount of waiting makes this fit, so don't return 429.
             raise GatewayError(
-                400, "invalid_request_error", "request_exceeds_token_limit",
+                400,
+                "invalid_request_error",
+                "request_exceeds_token_limit",
                 f"This request needs ~{exc.tokens} tokens (prompt + max_tokens) but your limit is {exc.limit} per minute. "
                 "Reduce max_tokens or the prompt size.",
                 param="max_tokens",
             ) from None
         if isinstance(decision, RateLimited):
-            logger.info("rid=%s tenant=%s rate limited (needs %d, used %d/%d)", rid, tenant_name, reserve_tokens,
-                        decision.state.used, limit)
+            logger.info(
+                "rid=%s tenant=%s rate limited (needs %d, used %d/%d)",
+                rid,
+                tenant_name,
+                reserve_tokens,
+                decision.state.used,
+                limit,
+            )
             raise GatewayError(
-                429, "rate_limit_error", "tenant_token_limit_exceeded",
+                429,
+                "rate_limit_error",
+                "tenant_token_limit_exceeded",
                 f"Rate limit reached: {limit} tokens per minute. Retry after {decision.retry_after_s}s.",
                 headers={"retry-after": str(decision.retry_after_s), **ratelimit_headers(decision.state)},
             )
@@ -256,10 +297,16 @@ def create_app(
 
         async def unavailable(exc: AllProvidersFailed) -> GatewayError:
             await limiter.release(reservation.id)  # nothing was generated: refund
-            logger.error("rid=%s all providers failed: %s", rid, [(a.provider, a.outcome, a.elapsed_ms) for a in exc.attempts])
-            return GatewayError(503, "upstream_error", "all_providers_unavailable",
-                                "All model providers are currently unavailable. Please retry shortly.",
-                                headers={"retry-after": "5"})
+            logger.error(
+                "rid=%s all providers failed: %s", rid, [(a.provider, a.outcome, a.elapsed_ms) for a in exc.attempts]
+            )
+            return GatewayError(
+                503,
+                "upstream_error",
+                "all_providers_unavailable",
+                "All model providers are currently unavailable. Please retry shortly.",
+                headers={"retry-after": "5"},
+            )
 
         # ---------------------------------------------------------- non-streaming
         if not body.stream:
@@ -275,10 +322,20 @@ def create_app(
             if not isinstance(actual, int) or actual < 0:
                 actual = prompt_est + estimate_text_tokens(" " * _output_chars(result.body.get("choices", [])))
             await limiter.reconcile(reservation.id, actual, reservation.key_hash)
-            logger.info("rid=%s tenant=%s provider=%s fallback=%s reserved=%d actual=%d attempts=%s", rid, tenant_name,
-                        result.provider, result.fallback_used, reservation.tokens, actual,
-                        [(a.provider, a.outcome) for a in result.attempts])
-            return JSONResponse(result.body, headers=final_headers(actual, result.provider, result.fallback_used))
+            headers = final_headers(actual, result.provider, result.fallback_used)
+            if settings.redact_pii:
+                headers["x-guardrail-redactions"] = str(redact_completion(result.body))
+            logger.info(
+                "rid=%s tenant=%s provider=%s fallback=%s reserved=%d actual=%d attempts=%s",
+                rid,
+                tenant_name,
+                result.provider,
+                result.fallback_used,
+                reservation.tokens,
+                actual,
+                [(a.provider, a.outcome) for a in result.attempts],
+            )
+            return JSONResponse(result.body, headers=headers)
 
         # ---------------------------------------------------------- streaming
         client_wants_usage = bool((payload.get("stream_options") or {}).get("include_usage"))
@@ -293,34 +350,55 @@ def create_app(
         async def relay():
             delivered_chars = 0
             actual: int | None = None
+            guard = ChunkGuard() if settings.redact_pii else None
             try:
                 async for item in route.events:
                     if item == "[DONE]":
+                        if guard is not None and (tail := guard.finish()) is not None:
+                            yield _sse(tail)
                         yield b"data: [DONE]\n\n"
                         break
                     assert isinstance(item, dict)
                     if "error" in item:
                         # Committed already - no failover possible. Sanitise and end.
-                        yield _sse(error_body("upstream_error", "upstream_stream_interrupted",
-                                              "The model provider stream was interrupted", rid))
+                        yield _sse(
+                            error_body(
+                                "upstream_error",
+                                "upstream_stream_interrupted",
+                                "The model provider stream was interrupted",
+                                rid,
+                            )
+                        )
                         break
                     if isinstance(item.get("usage"), dict) and isinstance(item["usage"].get("total_tokens"), int):
                         actual = item["usage"]["total_tokens"]
                         if not client_wants_usage and not item.get("choices"):
                             continue  # we asked for the usage chunk for accounting; client didn't
                     delivered_chars += _output_chars(item.get("choices") or [])
+                    if guard is not None:
+                        item = guard.process(item)
+                        if item is None:
+                            continue
                     yield _sse(item)
             finally:
                 await route.aclose()
                 # Client disconnects still pay for what was generated; refund only if nothing was.
                 charge = actual if actual is not None else prompt_est + estimate_text_tokens(" " * delivered_chars)
                 await asyncio.shield(limiter.reconcile(reservation.id, charge, reservation.key_hash))
-                logger.info("rid=%s tenant=%s stream provider=%s fallback=%s charged=%d", rid, tenant_name,
-                            route.provider, route.fallback_used, charge)
+                logger.info(
+                    "rid=%s tenant=%s stream provider=%s fallback=%s charged=%d",
+                    rid,
+                    tenant_name,
+                    route.provider,
+                    route.fallback_used,
+                    charge,
+                )
 
         headers = final_headers(reservation.tokens, route.provider, route.fallback_used)
         headers.update({"cache-control": "no-cache", "x-accel-buffering": "no"})
-        return StreamingResponse(relay(), media_type="text/event-stream", headers=headers)
+        return StreamingResponse(
+            with_heartbeat(relay(), settings.heartbeat_s), media_type="text/event-stream", headers=headers
+        )
 
     return app
 
@@ -330,5 +408,7 @@ def _sse(obj: dict) -> bytes:
 
 
 def app_factory() -> FastAPI:
-    logging.basicConfig(level=os.environ.get("ROUTER_LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(
+        level=os.environ.get("ROUTER_LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
     return create_app(RouterSettings.from_env())

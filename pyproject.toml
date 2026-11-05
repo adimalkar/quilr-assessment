@@ -16,6 +16,7 @@ dependencies = [
 dev = [
     "pytest>=9.2.0",
     "pytest-asyncio>=1.4.1.post1",
+    "ruff>=0.17.4",
 ]
 
 [tool.pytest.ini_options]
@@ -23,3 +24,18 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 pythonpath = ["."]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+# T20: no print() anywhere in library code - stdout is the MCP wire in Task 1.
+select = ["E", "F", "W", "I", "B", "UP", "T20", "SIM", "RUF100"]
+ignore = ["E501", "B008", "SIM105", "UP042"]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/*" = ["T20"]
+"tests/*" = ["T20", "B011", "SIM117", "UP031", "E741"]
+"task2_mcp_gateway/devtoken.py" = ["T20"]  # CLI: printing the token *is* the output

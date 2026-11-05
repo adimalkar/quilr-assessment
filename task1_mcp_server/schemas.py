@@ -52,8 +52,22 @@ class TriggerRefundInput(_StrictModel):
         str,
         # Whitespace is stripped *before* the length check, so ten spaces is not a reason.
         StringConstraints(strip_whitespace=True, min_length=10, max_length=500),
-        Field(description="Human-readable justification (10-500 characters).", examples=["Duplicate charge on invoice"]),
+        Field(
+            description="Human-readable justification (10-500 characters).", examples=["Duplicate charge on invoice"]
+        ),
     ]
+    idempotency_key: Annotated[
+        str | None,
+        StringConstraints(pattern=r"^[A-Za-z0-9_\-]{8,64}$"),
+        Field(
+            description=(
+                "Optional client-generated key (8-64 chars of [A-Za-z0-9_-]). Retrying with the same key and "
+                "arguments returns the original refund instead of issuing a second one; reusing a key with "
+                "different arguments is rejected. Agents retry on timeouts - money movement must not duplicate."
+            ),
+            examples=["refund-7f3c9a1e"],
+        ),
+    ] = None
 
     @field_validator("amount")
     @classmethod
@@ -95,6 +109,8 @@ class RefundReceipt(BaseModel):
     reason: str
     status: str
     remaining_refundable_balance: float
+    idempotency_key: str | None = None
+    replayed: bool = False  # true when this is the stored result of an earlier call with the same key
 
 
 TOOL_OUTPUT_MODELS: dict[str, type[BaseModel]] = {

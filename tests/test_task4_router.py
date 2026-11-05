@@ -6,7 +6,6 @@ import json
 import subprocess
 import sys
 import textwrap
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -15,7 +14,7 @@ import httpx
 import pytest
 
 from task4_model_router.app import RouterSettings, create_app
-from task4_model_router.limiter import RateLimited, Reservation, RequestTooLarge, SQLiteTokenLimiter, hash_key
+from task4_model_router.limiter import RateLimited, RequestTooLarge, Reservation, SQLiteTokenLimiter, hash_key
 from task4_model_router.mock_providers import build as build_provider
 from task4_model_router.router import CircuitBreaker, Provider
 
@@ -171,7 +170,9 @@ def test_multi_process_concurrency_never_overshoots(tmp_path):
         ok = sum(isinstance(lim.reserve_sync(hash_key("shared"), 1_000), Reservation) for _ in range(40))
         print(ok)
     """)
-    procs = [subprocess.Popen([sys.executable, "-c", worker], cwd=ROOT, stdout=subprocess.PIPE, text=True) for _ in range(4)]
+    procs = [
+        subprocess.Popen([sys.executable, "-c", worker], cwd=ROOT, stdout=subprocess.PIPE, text=True) for _ in range(4)
+    ]
     admitted = sum(int(p.communicate(timeout=60)[0].strip()) for p in procs)
     assert admitted == 50  # 4 x 40 attempts of 1k tokens against a 50k budget
     lim = SQLiteTokenLimiter(db)
@@ -207,7 +208,9 @@ def gw(providers, tmp_path):
 
 def chat(url: str, key: str = TENANT, **body) -> httpx.Response:
     payload = {"model": "gpt-x", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100, **body}
-    return httpx.post(f"{url}/v1/chat/completions", json=payload, headers={"authorization": f"Bearer {key}"}, timeout=30)
+    return httpx.post(
+        f"{url}/v1/chat/completions", json=payload, headers={"authorization": f"Bearer {key}"}, timeout=30
+    )
 
 
 def assert_error_envelope(resp: httpx.Response, status: int, err_type: str, code: str) -> dict:
@@ -340,8 +343,12 @@ def test_auth_errors(gw):
 
 @pytest.mark.parametrize(
     "body",
-    [{"messages": []}, {"messages": [{"role": "wizard", "content": "x"}]}, {"messages": "hi"},
-     {"messages": [{"role": "user", "content": "x"}], "max_tokens": -5}],
+    [
+        {"messages": []},
+        {"messages": [{"role": "wizard", "content": "x"}]},
+        {"messages": "hi"},
+        {"messages": [{"role": "user", "content": "x"}], "max_tokens": -5},
+    ],
 )
 def test_validation_errors_standardised(gw, body):
     r = httpx.post(f"{gw}/v1/chat/completions", json=body, headers={"authorization": f"Bearer {TENANT}"})
@@ -349,8 +356,11 @@ def test_validation_errors_standardised(gw, body):
 
 
 def test_malformed_json_and_unknown_route(gw):
-    r = httpx.post(f"{gw}/v1/chat/completions", content=b"{oops", headers={"authorization": f"Bearer {TENANT}",
-                                                                          "content-type": "application/json"})
+    r = httpx.post(
+        f"{gw}/v1/chat/completions",
+        content=b"{oops",
+        headers={"authorization": f"Bearer {TENANT}", "content-type": "application/json"},
+    )
     assert_error_envelope(r, 400, "invalid_request_error", "invalid_request")
     assert_error_envelope(httpx.get(f"{gw}/admin/secrets"), 404, "invalid_request_error", "not_found")
 
@@ -435,8 +445,11 @@ def test_auth_happens_before_body_parsing(gw):
 
 def test_body_size_limit_standardised(gw):
     big = b'{"messages":[{"role":"user","content":"' + b"a" * 5_000_000 + b'"}]}'
-    r = httpx.post(f"{gw}/v1/chat/completions", content=big,
-                   headers={"authorization": f"Bearer {TENANT}", "content-type": "application/json"})
+    r = httpx.post(
+        f"{gw}/v1/chat/completions",
+        content=big,
+        headers={"authorization": f"Bearer {TENANT}", "content-type": "application/json"},
+    )
     assert_error_envelope(r, 413, "invalid_request_error", "request_too_large")
 
 
@@ -461,9 +474,9 @@ def test_half_open_allows_single_probe():
     cb = CircuitBreaker(failure_threshold=1, cooldown_s=10, probe_timeout_s=5, clock=clock)
     cb.record_failure("p")
     clock.advance(10)
-    assert cb.available("p") is True   # first caller gets the probe
+    assert cb.available("p") is True  # first caller gets the probe
     assert cb.available("p") is False  # concurrent callers don't pile onto a maybe-dead provider
-    cb.record_failure("p")             # probe failed -> open again immediately
+    cb.record_failure("p")  # probe failed -> open again immediately
     assert cb.available("p") is False
     clock.advance(10)
     assert cb.available("p") is True
@@ -473,15 +486,92 @@ def test_half_open_allows_single_probe():
 
 async def test_fallback_flag_reflects_serving_provider():
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"choices": [{"index": 0, "message": {"content": "hi"}}],
-                                         "usage": {"total_tokens": 3}})
+        return httpx.Response(
+            200, json={"choices": [{"index": 0, "message": {"content": "hi"}}], "usage": {"total_tokens": 3}}
+        )
 
     clock = FakeClock(0)
     breaker = CircuitBreaker(clock=clock, rate_limit_default_s=5)
-    router = ModelRouter([Provider("primary", "http://p/v1"), Provider("secondary", "http://s/v1")],
-                         breaker=breaker, transport=httpx.MockTransport(handler))
+    router = ModelRouter(
+        [Provider("primary", "http://p/v1"), Provider("secondary", "http://s/v1")],
+        breaker=breaker,
+        transport=httpx.MockTransport(handler),
+    )
     breaker.record_rate_limited("primary", 5)
     breaker.record_rate_limited("secondary", 5)  # everyone cooling down -> primary still tried first
     result = await router.complete({"messages": []}, "rid")
     await router.aclose()
     assert result.provider == "primary" and result.fallback_used is False
+
+
+# =============================================================================== iteration 4 (peer benchmark)
+def test_mock_providers_controllable_at_runtime(providers):
+    """Reviewers can trigger failover by hand: POST /_mock/mode, GET /_mock/stats, or x-mock-mode header."""
+    r = httpx.post(f"{providers['p_url']}/_mock/mode", json={"mode": "rate_limited", "retry_after": "7"})
+    assert r.json()["mode"] == "rate_limited"
+    resp = httpx.post(f"{providers['p_url']}/v1/chat/completions", json={"messages": []})
+    assert resp.status_code == 429 and resp.headers["retry-after"] == "7"
+    httpx.post(f"{providers['p_url']}/_mock/mode", json={"mode": "ok"})
+    resp = httpx.post(
+        f"{providers['p_url']}/v1/chat/completions", json={"messages": []}, headers={"x-mock-mode": "server_error"}
+    )
+    assert resp.status_code == 500
+    assert httpx.get(f"{providers['p_url']}/_mock/stats").json()["calls"] >= 2
+
+
+def _composed(providers, tmp_path, **kw):
+    settings = RouterSettings(
+        db_path=str(tmp_path / "c.db"),
+        primary=Provider("primary", f"{providers['p_url']}/v1"),
+        secondary=Provider("secondary", f"{providers['s_url']}/v1"),
+        tenants=[(TENANT, "acme", None)],
+        **kw,
+    )
+    return create_app(settings)
+
+
+def test_composed_router_redacts_pii(providers, tmp_path):
+    """Task 3 inside Task 4: one endpoint with rate limiting, failover *and* streaming PII redaction."""
+    for st in (providers["p"], providers["s"]):
+        st.update(mode="ok", calls=0)
+    providers["p"]["mode"] = "rate_limited"  # force failover too
+    with run_uvicorn(_composed(providers, tmp_path, redact_pii=True)) as url:
+        # the mock echoes "Hello from <name>": use a name with PII to prove redaction on both paths
+        providers["s"]["name"] = "bob@corp.example"
+        r = chat(url)
+        s = chat(url, stream=True)
+    providers["s"]["name"] = "secondary"
+    assert r.headers["x-gateway-provider"] == "secondary"
+    assert "bob@corp.example" not in r.text and "[REDACTED]" in r.text
+    assert r.headers["x-guardrail-redactions"] == "1"
+    assert "bob@corp.example" not in s.text and "[REDACTED]" in s.text
+
+
+def test_sqlite_lock_is_fast_503_not_500(providers, tmp_path):
+    import sqlite3
+
+    app = _composed(providers, tmp_path, sqlite_busy_timeout_ms=200)
+    with run_uvicorn(app) as url:
+        blocker = sqlite3.connect(str(tmp_path / "c.db"), isolation_level=None)
+        blocker.execute("BEGIN EXCLUSIVE")  # another process holds the write lock
+        try:
+            t0 = time.perf_counter()
+            r = chat(url)
+            elapsed = time.perf_counter() - t0
+        finally:
+            blocker.execute("ROLLBACK")
+            blocker.close()
+    assert_error_envelope(r, 503, "service_unavailable", "rate_limiter_unavailable")
+    assert elapsed < 2
+
+
+def test_stream_heartbeat_during_idle(providers, tmp_path):
+    providers["p"].update(mode="stream_slow_first", delay_s=1.2)
+    with run_uvicorn(_composed(providers, tmp_path, heartbeat_s=0.3)) as url:
+        # TTFT deadline is 3 s, so the primary commits after 1.2 s; heartbeats only start after commit
+        r = chat(url, stream=True)
+    providers["p"].update(mode="ok", delay_s=0.0)
+    content = "".join(
+        c["delta"].get("content", "") for i in _sse_items(r.text) if isinstance(i, dict) for c in i.get("choices", [])
+    )
+    assert r.status_code == 200 and content.strip() == "Hello from primary"

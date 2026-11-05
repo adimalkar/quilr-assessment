@@ -12,6 +12,7 @@ bodies/headers, exception text and stack traces are logged server-side only.
 from __future__ import annotations
 
 import logging
+import sqlite3
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -50,7 +51,9 @@ def install_error_handlers(app: FastAPI) -> None:
     async def _gateway(request: Request, exc: GatewayError) -> JSONResponse:
         headers = {"x-request-id": _rid(request), **exc.headers}
         return JSONResponse(
-            error_body(exc.err_type, exc.code, exc.message, _rid(request), exc.param), status_code=exc.status, headers=headers
+            error_body(exc.err_type, exc.code, exc.message, _rid(request), exc.param),
+            status_code=exc.status,
+            headers=headers,
         )
 
     @app.exception_handler(RequestValidationError)
@@ -71,6 +74,21 @@ def install_error_handlers(app: FastAPI) -> None:
             error_body("invalid_request_error", code, "Request could not be served", _rid(request)),
             status_code=exc.status_code,
             headers={"x-request-id": _rid(request)},
+        )
+
+    @app.exception_handler(sqlite3.Error)
+    async def _storage(request: Request, exc: sqlite3.Error) -> JSONResponse:
+        # Locked / busy / I/O errors from the limiter DB: a clean, retryable 503 (not a generic 500).
+        logger.error("rate-limit store error rid=%s: %s", _rid(request), type(exc).__name__)
+        return JSONResponse(
+            error_body(
+                "service_unavailable",
+                "rate_limiter_unavailable",
+                "The rate limiter is temporarily unavailable. Please retry.",
+                _rid(request),
+            ),
+            status_code=503,
+            headers={"x-request-id": _rid(request), "retry-after": "1"},
         )
 
     @app.exception_handler(Exception)

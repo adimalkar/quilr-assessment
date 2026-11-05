@@ -15,6 +15,7 @@ Run:  GATEWAY_JWT_SECRET=... GATEWAY_DOWNSTREAM_URL=http://127.0.0.1:9001/mcp \
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -29,6 +30,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import Response, StreamingResponse
 
+from task3_llm_guardrail.redactor import redact_text
 from task3_llm_guardrail.sse import SSEDecoder, encode_event
 
 from . import jsonrpc as rpc
@@ -46,8 +48,16 @@ _FORWARD_REQUEST_HEADERS = {"content-type", "accept", "last-event-id", "user-age
 # RFC 9110 §7.6.1 hop-by-hop headers (+ content-length, which the ASGI server recomputes).
 # Content-Encoding is end-to-end and is preserved on the streaming path.
 _HOP_BY_HOP = {
-    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "proxy-connection", "te",
-    "trailer", "transfer-encoding", "upgrade", "content-length",
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "content-length",
 }
 
 
@@ -72,6 +82,12 @@ class GatewaySettings:
     # subject, so one user can't exhaust the connections every other user's POSTs need.
     max_streams_per_subject: int = 4
     max_streams_total: int = 500
+    # DLP on tool *results* (Task 3's redactor): "off" | "viewers" | "all". Data leaving a tool is
+    # exactly what an agent should not see in clear (e.g. a customer record's email).
+    redact_tool_results: str = "off"
+    # Pin each tool's definition (description + schemas) at first sight; if the downstream later changes
+    # it ("rug pull" / tool poisoning), the tool is hidden from tools/list and calls to it are denied.
+    pin_tool_definitions: bool = False
 
     @classmethod
     def from_env(cls) -> GatewaySettings:
@@ -86,6 +102,8 @@ class GatewaySettings:
             filter_tools_list=os.environ.get("GATEWAY_FILTER_TOOLS_LIST", "0").lower() in {"1", "true", "yes"},
             allowed_origins=frozenset(o for o in os.environ.get("GATEWAY_ALLOWED_ORIGINS", "").split(",") if o),
             downstream_headers=extra,
+            redact_tool_results=os.environ.get("GATEWAY_REDACT_TOOL_RESULTS", "off"),
+            pin_tool_definitions=os.environ.get("GATEWAY_PIN_TOOLS", "0").lower() in {"1", "true", "yes"},
         )
 
 
@@ -116,6 +134,10 @@ def create_app(settings: GatewaySettings, *, transport: httpx.AsyncBaseTransport
         follow_redirects=False,
     )
     open_streams: Counter[str] = Counter()
+    if settings.redact_tool_results not in {"off", "viewers", "all"}:
+        raise ValueError("redact_tool_results must be 'off', 'viewers' or 'all'")
+    tool_pins: dict[str, str] = {}  # tool name -> sha256 of its first-seen definition
+    tainted_tools: set[str] = set()  # tools whose definition changed after pinning
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -175,7 +197,8 @@ def create_app(settings: GatewaySettings, *, transport: httpx.AsyncBaseTransport
 
     def downstream_headers(request: Request, principal: Principal, rid: str, sid: str | None) -> dict[str, str]:
         headers = {
-            k: v for k, v in request.headers.items()
+            k: v
+            for k, v in request.headers.items()
             if (k in _FORWARD_REQUEST_HEADERS or k.startswith("mcp-")) and k != "mcp-session-id"
         }
         if sid is not None:
@@ -188,8 +211,9 @@ def create_app(settings: GatewaySettings, *, transport: httpx.AsyncBaseTransport
         headers.update(settings.downstream_headers)
         return headers
 
-    def copy_response_headers(response: Response, upstream: httpx.Response, principal: Principal, rid: str,
-                              *, decoded: bool = False) -> Response:
+    def copy_response_headers(
+        response: Response, upstream: httpx.Response, principal: Principal, rid: str, *, decoded: bool = False
+    ) -> Response:
         connection_named = {
             t.strip().lower() for v in upstream.headers.get_list("connection") for t in v.split(",") if t.strip()
         }
@@ -245,7 +269,21 @@ def create_app(settings: GatewaySettings, *, transport: httpx.AsyncBaseTransport
             audit(ctx, method="tools/call", decision="reject", reason="missing tool name")
             return rpc.error(msg.get("id"), rpc.INVALID_PARAMS, "params.name must be a non-empty string")
         decision = authorize_tool_call(principal, name)
-        audit(ctx, method="tools/call", tool=name, decision="allow" if decision.allowed else "deny", reason=decision.reason)
+        audit(
+            ctx,
+            method="tools/call",
+            tool=name,
+            decision="allow" if decision.allowed else "deny",
+            reason=decision.reason,
+        )
+        if decision.allowed and name in tainted_tools:
+            audit(ctx, method="tools/call", tool=name, decision="deny", reason="tool definition changed since pinned")
+            return rpc.error(
+                msg.get("id"),
+                rpc.UNAUTHORIZED_TOOL_CALL,
+                "Unauthorized Tool Call",
+                {"reason": "tool_definition_changed", "tool": name},
+            )
         if decision.allowed:
             return None
         if decision.code == "invalid_tool_name":
@@ -257,12 +295,23 @@ def create_app(settings: GatewaySettings, *, transport: httpx.AsyncBaseTransport
             {"reason": decision.code, "tool": name, "required_role": "admin"},
         )
 
-    async def send_downstream(method: str, request: Request, principal: Principal, rid: str, sid: str | None,
-                              content: bytes | None, *, long_lived: bool = False) -> httpx.Response:
+    async def send_downstream(
+        method: str,
+        request: Request,
+        principal: Principal,
+        rid: str,
+        sid: str | None,
+        content: bytes | None,
+        *,
+        long_lived: bool = False,
+    ) -> httpx.Response:
         http = stream_client if long_lived else client
         req = http.build_request(
-            method, settings.downstream_url, content=content,
-            headers=downstream_headers(request, principal, rid, sid), params=request.query_params,
+            method,
+            settings.downstream_url,
+            content=content,
+            headers=downstream_headers(request, principal, rid, sid),
+            params=request.query_params,
         )
         try:
             return await http.send(req, stream=True)
@@ -285,8 +334,9 @@ def create_app(settings: GatewaySettings, *, transport: httpx.AsyncBaseTransport
                 if on_close:
                     on_close()
 
-        response = StreamingResponse(body(), status_code=upstream.status_code,
-                                     media_type=upstream.headers.get("content-type"))
+        response = StreamingResponse(
+            body(), status_code=upstream.status_code, media_type=upstream.headers.get("content-type")
+        )
         return copy_response_headers(response, upstream, principal, rid)  # type: ignore[return-value]
 
     async def buffered(upstream: httpx.Response, limit: int = 10_000_000) -> bytes:
@@ -301,11 +351,59 @@ def create_app(settings: GatewaySettings, *, transport: httpx.AsyncBaseTransport
             await upstream.aclose()
 
     def filter_tools_payload(msg: Any, principal: Principal) -> Any:
-        if isinstance(msg, dict) and isinstance(msg.get("result"), dict) and isinstance(msg["result"].get("tools"), list):
+        if (
+            isinstance(msg, dict)
+            and isinstance(msg.get("result"), dict)
+            and isinstance(msg["result"].get("tools"), list)
+        ):
             msg["result"]["tools"] = [
-                t for t in msg["result"]["tools"]
+                t
+                for t in msg["result"]["tools"]
                 if isinstance(t, dict) and isinstance(t.get("name"), str) and tool_visible(principal, t["name"])
             ]
+        return msg
+
+    def pin_tools(msg: Any, ctx: dict[str, Any]) -> Any:
+        if not (
+            isinstance(msg, dict)
+            and isinstance(msg.get("result"), dict)
+            and isinstance(msg["result"].get("tools"), list)
+        ):
+            return msg
+        kept = []
+        for tool in msg["result"]["tools"]:
+            if not isinstance(tool, dict) or not isinstance(tool.get("name"), str):
+                continue
+            digest = hashlib.sha256(json.dumps(tool, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            pinned = tool_pins.setdefault(tool["name"], digest)
+            if pinned != digest or tool["name"] in tainted_tools:
+                if tool["name"] not in tainted_tools:
+                    tainted_tools.add(tool["name"])
+                    logger.warning("tool %r definition changed since it was pinned; quarantined", tool["name"])
+                    audit(
+                        ctx, method="tools/list", tool=tool["name"], decision="quarantine", reason="definition changed"
+                    )
+                continue
+            kept.append(tool)
+        msg["result"]["tools"] = kept
+        return msg
+
+    def redact_result(msg: Any, counter: list[int]) -> Any:
+        if not (isinstance(msg, dict) and "result" in msg):
+            return msg
+
+        def walk(node: Any) -> Any:
+            if isinstance(node, str):
+                out, n = redact_text(node)
+                counter[0] += n
+                return out
+            if isinstance(node, dict):
+                return {k: (v if k in ("type", "mimeType", "uri") else walk(v)) for k, v in node.items()}
+            if isinstance(node, list):
+                return [walk(v) for v in node]
+            return node
+
+        msg["result"] = walk(msg["result"])
         return msg
 
     def rewrite_body(body: bytes, content_type: str, transform) -> bytes:
@@ -317,7 +415,9 @@ def create_app(settings: GatewaySettings, *, transport: httpx.AsyncBaseTransport
             decoder, out = SSEDecoder(), []
             for ev in [*decoder.feed(body), *decoder.close()]:
                 try:
-                    out.append(encode_event(json.dumps(transform(json.loads(ev.data)), separators=(",", ":")), ev.event))
+                    out.append(
+                        encode_event(json.dumps(transform(json.loads(ev.data)), separators=(",", ":")), ev.event)
+                    )
                 except ValueError:
                     logger.warning("dropping unparseable SSE event from filtered tools/list")
             return b"".join(out)
@@ -360,7 +460,9 @@ def create_app(settings: GatewaySettings, *, transport: httpx.AsyncBaseTransport
             raise _Reject(400, rpc.error(None, rpc.INVALID_REQUEST, "Batch requests are not supported"))
 
         if problem := rpc.envelope_problem(msg) or rpc.smuggling_problem(msg):
-            raise _Reject(400, rpc.error(msg.get("id") if isinstance(msg, dict) else None, rpc.INVALID_REQUEST, problem))
+            raise _Reject(
+                400, rpc.error(msg.get("id") if isinstance(msg, dict) else None, rpc.INVALID_REQUEST, problem)
+            )
         check_mirror_headers(request, msg)
 
         if denied := policy_check(principal, msg, ctx):
@@ -373,13 +475,42 @@ def create_app(settings: GatewaySettings, *, transport: httpx.AsyncBaseTransport
         # Forward the exact message we authorised (re-serialised), not the raw bytes.
         upstream = await send_downstream("POST", request, principal, rid, sid, rpc.dumps(msg))
 
-        if method == "tools/list" and settings.filter_tools_list and not principal.is_admin and upstream.is_success:
+        transforms = []
+        if method == "tools/list" and settings.pin_tool_definitions:
+            transforms.append(lambda m: pin_tools(m, ctx))
+        if method == "tools/list" and settings.filter_tools_list and not principal.is_admin:
+            transforms.append(lambda m: filter_tools_payload(m, principal))
+        redactions = [0]
+        if method == "tools/call" and (
+            settings.redact_tool_results == "all"
+            or (settings.redact_tool_results == "viewers" and not principal.is_admin)
+        ):
+            transforms.append(lambda m: redact_result(m, redactions))
+
+        if transforms and upstream.is_success:
+            # Bounded buffering of this one response (tool lists / tool results), never of long-lived streams.
             ctype = upstream.headers.get("content-type", "")
             data = await buffered(upstream)
+
+            def apply(m: Any) -> Any:
+                for t in transforms:
+                    m = t(m)
+                return m
+
             try:
-                data = rewrite_body(data, ctype, lambda m: filter_tools_payload(m, principal))
+                data = rewrite_body(data, ctype, apply)
             except (ValueError, UnicodeDecodeError):
-                raise _Reject(502, rpc.error(msg.get("id"), rpc.UPSTREAM_UNAVAILABLE, "Unreadable downstream response")) from None
+                raise _Reject(
+                    502, rpc.error(msg.get("id"), rpc.UPSTREAM_UNAVAILABLE, "Unreadable downstream response")
+                ) from None
+            if redactions[0]:
+                audit(
+                    ctx,
+                    method=method,
+                    tool=(msg.get("params") or {}).get("name"),
+                    decision="redacted",
+                    redactions=redactions[0],
+                )
             response = Response(data, status_code=upstream.status_code, media_type=ctype or None)
             return copy_response_headers(response, upstream, principal, rid, decoded=True)
 

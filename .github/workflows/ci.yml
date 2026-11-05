@@ -1,0 +1,33 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - run: uv sync --locked
+      - name: lint (ruff, incl. T20 no-print rule)
+        run: uv run ruff check . && uv run ruff format --check .
+      - name: tests (real processes + sockets)
+        run: uv run pytest -q
+      - name: end-to-end demo
+        run: uv run python scripts/demo.py
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t quilr-assessment .
+      - name: compose config is valid
+        run: GATEWAY_JWT_SECRET=ci-secret-ci-secret-ci-secret-ci-secret docker compose config -q

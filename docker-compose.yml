@@ -1,0 +1,73 @@
+# docker compose up --build        (or: podman compose up --build)
+# Only the two gateways are published; MCP server, mock LLM and providers live on an internal network.
+x-app: &app
+  build: .
+  image: quilr-assessment:latest
+  restart: unless-stopped
+
+services:
+  task1-mcp-http:          # Task 1 server over Streamable HTTP (the stdio server: `python -m task1_mcp_server`)
+    <<: *app
+    command: uvicorn --factory task1_mcp_server.http_app:app_factory --host 0.0.0.0 --port 9101
+    networks: [internal]
+
+  mcp-gateway:             # Task 2
+    <<: *app
+    command: uvicorn --factory task2_mcp_gateway.gateway:app_factory --host 0.0.0.0 --port 9000
+    environment:
+      GATEWAY_JWT_SECRET: ${GATEWAY_JWT_SECRET:?set GATEWAY_JWT_SECRET (see .env.example)}
+      GATEWAY_DOWNSTREAM_URL: http://task1-mcp-http:9101/mcp
+      GATEWAY_REDACT_TOOL_RESULTS: ${GATEWAY_REDACT_TOOL_RESULTS:-viewers}
+      GATEWAY_PIN_TOOLS: ${GATEWAY_PIN_TOOLS:-1}
+    ports: ["127.0.0.1:9000:9000"]
+    depends_on: [task1-mcp-http]
+    networks: [internal, public]
+
+  mock-llm:                # OpenAI-compatible mock for Task 3
+    <<: *app
+    command: uvicorn --factory task3_llm_guardrail.mock_llm:app_factory --host 0.0.0.0 --port 8301
+    networks: [internal]
+
+  pii-guardrail:           # Task 3
+    <<: *app
+    command: uvicorn --factory task3_llm_guardrail.gateway:app_factory --host 0.0.0.0 --port 8300
+    environment:
+      GUARD_UPSTREAM_BASE_URL: ${GUARD_UPSTREAM_BASE_URL:-http://mock-llm:8301/v1}
+      GUARD_UPSTREAM_API_KEY: ${GUARD_UPSTREAM_API_KEY:-}
+    ports: ["127.0.0.1:8300:8300"]
+    depends_on: [mock-llm]
+    networks: [internal, public]
+
+  provider-primary:
+    <<: *app
+    command: uvicorn --factory task4_model_router.mock_providers:app_factory --host 0.0.0.0 --port 8401
+    environment: {MOCK_PROVIDER_NAME: primary}
+    ports: ["127.0.0.1:8401:8401"]   # published only so reviewers can POST /_mock/mode to trigger failover
+    networks: [internal, public]
+
+  provider-secondary:
+    <<: *app
+    command: uvicorn --factory task4_model_router.mock_providers:app_factory --host 0.0.0.0 --port 8402
+    environment: {MOCK_PROVIDER_NAME: secondary}
+    networks: [internal]
+
+  model-router:            # Task 4 (+ Task 3 redaction composed in)
+    <<: *app
+    command: uvicorn --factory task4_model_router.app:app_factory --host 0.0.0.0 --port 8400
+    environment:
+      ROUTER_DB_PATH: /data/router.db
+      ROUTER_TENANTS: ${ROUTER_TENANTS:-tenant-key-1:acme,tenant-key-tiny:tiny:3000}
+      ROUTER_PRIMARY_URL: http://provider-primary:8401/v1
+      ROUTER_SECONDARY_URL: http://provider-secondary:8402/v1
+      ROUTER_REDACT_PII: ${ROUTER_REDACT_PII:-1}
+    volumes: [router-data:/data]
+    ports: ["127.0.0.1:8400:8400"]
+    depends_on: [provider-primary, provider-secondary]
+    networks: [internal, public]
+
+networks:
+  internal: {internal: true}
+  public: {}
+
+volumes:
+  router-data: {}

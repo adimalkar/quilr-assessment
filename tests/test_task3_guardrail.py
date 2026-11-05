@@ -21,14 +21,22 @@ from .conftest import run_uvicorn
 @pytest.mark.parametrize(
     "pii",
     [
-        "jane.doe@example.com", "j+tag@sub.mail.example.co.uk", "a_b%c@x-y.io",
-        "123-45-6789", "123 45 6789",
-        "4111111111111111", "4111 1111 1111 1111", "4111-1111-1111-1111", "378282246310005", "3782 822463 10005",
-        "5555555555554444", "6011111111111117",
+        "jane.doe@example.com",
+        "j+tag@sub.mail.example.co.uk",
+        "a_b%c@x-y.io",
+        "123-45-6789",
+        "123 45 6789",
+        "4111111111111111",
+        "4111 1111 1111 1111",
+        "4111-1111-1111-1111",
+        "378282246310005",
+        "3782 822463 10005",
+        "5555555555554444",
+        "6011111111111117",
     ],
 )
 def test_detects(pii):
-    for template in ("{}", "x {} y", "({})", "{}.", "\"{}\"", "→{}←"):
+    for template in ("{}", "x {} y", "({})", "{}.", '"{}"', "→{}←"):
         out, n = redact_text(template.format(pii))
         assert pii not in out and n == 1, (template, out)
 
@@ -38,10 +46,17 @@ def test_detects(pii):
     [
         "4111 1111 1111 1112",  # fails Luhn
         "order 1234567890123",  # 13 digits, not Luhn
-        "000-12-3456", "666-12-3456", "123-00-4567", "123-45-0000",  # invalid SSN ranges (Presidio rules)
+        "000-12-3456",
+        "666-12-3456",
+        "123-00-4567",
+        "123-45-0000",  # invalid SSN ranges (Presidio rules)
         "123-45 6789",  # mixed separators
         "call 555-123-4567",  # phone number
-        "version 1.2.3", "2026-11-05", "user@localhost", "@handle", "not an email@",
+        "version 1.2.3",
+        "2026-11-05",
+        "user@localhost",
+        "@handle",
+        "not an email@",
         "1234-5678-9012-3456-7890",  # too long for any card shape
     ],
 )
@@ -55,9 +70,40 @@ def test_luhn():
 
 
 # =============================================================================== streaming == batch
-PII_SAMPLES = ["jane.doe@example.com", "123-45-6789", "4111 1111 1111 1111", "378282246310005", "a@b.co", "x.y@z.com.au"]
-FILLER = ["the", "order", "1234", "2024", "id", "café", "naïve", "😀", "-", "@", ".", ",", "\n", "a@", "4111", "123-45",
-          "SSN", "ssn:", "social security number", "is", "123456789", "4111.1111", "–", "exämple"]
+PII_SAMPLES = [
+    "jane.doe@example.com",
+    "123-45-6789",
+    "4111 1111 1111 1111",
+    "378282246310005",
+    "a@b.co",
+    "x.y@z.com.au",
+]
+FILLER = [
+    "the",
+    "order",
+    "1234",
+    "2024",
+    "id",
+    "café",
+    "naïve",
+    "😀",
+    "-",
+    "@",
+    ".",
+    ",",
+    "\n",
+    "a@",
+    "4111",
+    "123-45",
+    "SSN",
+    "ssn:",
+    "social security number",
+    "is",
+    "123456789",
+    "4111.1111",
+    "–",
+    "exämple",
+]
 
 
 def _random_text(rnd: random.Random, words: int = 60) -> str:
@@ -265,7 +311,12 @@ def test_first_token_latency_not_degraded(stack):
     first_content = None
     with httpx.stream("POST", f"{stack['gw']}/v1/chat/completions", json=body, timeout=20) as resp:
         for line in resp.iter_lines():
-            if first_content is None and line.startswith("data: {") and '"content":"' in line and '"content":""' not in line:
+            if (
+                first_content is None
+                and line.startswith("data: {")
+                and '"content":"' in line
+                and '"content":""' not in line
+            ):
                 first_content = time.perf_counter() - start
     total = time.perf_counter() - start
     assert first_content is not None
@@ -339,7 +390,9 @@ def _split(s: str, n: int = 3) -> list[str]:
 
 def test_legacy_function_call_arguments_redacted_and_intact():
     args = json.dumps({"to": "john.doe@example.com", "ssn": "123-45-6789"})
-    chunks = [{"choices": [{"index": 0, "delta": {"role": "assistant", "function_call": {"name": "send", "arguments": ""}}}]}]
+    chunks = [
+        {"choices": [{"index": 0, "delta": {"role": "assistant", "function_call": {"name": "send", "arguments": ""}}}]}
+    ]
     chunks += [{"choices": [{"index": 0, "delta": {"function_call": {"arguments": p}}}]} for p in _split(args)]
     chunks += [{"choices": [{"index": 0, "delta": {}, "finish_reason": "function_call"}]}]
     got = _collect(_run_guard(chunks), "delta", "function_call", "arguments")
@@ -363,10 +416,22 @@ def test_unknown_and_nested_text_fields_redacted(delta_key, make):
 
 
 def test_parallel_tool_calls_without_index_do_not_mix():
-    chunks = [{"choices": [{"index": 0, "delta": {"tool_calls": [
-        {"id": "a", "function": {"name": "f", "arguments": "x jo"}},
-        {"id": "b", "function": {"name": "g", "arguments": "hn@ex.com y"}},
-    ]}}]}, {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}]
+    chunks = [
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {"id": "a", "function": {"name": "f", "arguments": "x jo"}},
+                            {"id": "b", "function": {"name": "g", "arguments": "hn@ex.com y"}},
+                        ]
+                    },
+                }
+            ]
+        },
+        {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+    ]
     out = _run_guard(chunks)
     per_call: dict[str, str] = {}
     for c in out:
@@ -377,10 +442,20 @@ def test_parallel_tool_calls_without_index_do_not_mix():
 
 
 def test_non_stream_redacts_every_field():
-    body = {"choices": [{"index": 0, "message": {
-        "role": "assistant", "content": [{"type": "text", "text": "mail a@b.com"}],
-        "function_call": {"name": "send", "arguments": "{\"to\": \"x@y.org\"}"},
-        "audio": {"transcript": "ssn 123-45-6789"}}, "logprobs": {"content": [{"token": "a@b.com"}]}}]}
+    body = {
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "mail a@b.com"}],
+                    "function_call": {"name": "send", "arguments": '{"to": "x@y.org"}'},
+                    "audio": {"transcript": "ssn 123-45-6789"},
+                },
+                "logprobs": {"content": [{"token": "a@b.com"}]},
+            }
+        ]
+    }
     n = redact_completion(body)
     blob = json.dumps(body)
     assert n == 3 and "a@b.com" not in blob and "x@y.org" not in blob and "6789" not in blob and "logprobs" not in blob
@@ -394,3 +469,68 @@ def test_upstream_auth_failure_is_gateway_error():
     with run_uvicorn(app) as gw:
         r = httpx.post(f"{gw}/v1/chat/completions", json={"messages": [], "stream": True})
     assert r.status_code == 502 and "sk-abc" not in r.text
+
+
+# =============================================================================== iteration 4 (peer benchmark)
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("john@example.com5", "[REDACTED]5"),  # TLDs are letters-only: a trailing digit ends the email
+        ("john@example.com123-45-6789", "[REDACTED][REDACTED]"),
+        ("94111 1111 1111 1111", "9[REDACTED]"),  # grouped card glued to a leading digit
+        ("4111 1111 1111 11119", "[REDACTED]9"),  # ...and to a trailing digit (Luhn-valid prefix kept)
+        ("123-45-67899", "[REDACTED]9"),
+        ("a@b.com-foo", "[REDACTED]-foo"),
+        ("a@b.example.com5.net ok", "[REDACTED] ok"),  # digits inside a label are fine
+        ("4111 1111 1111 1112", "4111 1111 1111 1112"),  # still Luhn-gated
+        ("call 555-123-4567 on 2026-11-05", "call 555-123-4567 on 2026-11-05"),
+    ],
+)
+def test_digit_and_letter_adjacency(text, expected):
+    assert redact_text(text)[0] == expected
+
+
+# Ground-truth oracle (independent of the production regexes): we know exactly which PII strings were
+# injected, so the streamed output must contain none of them, whatever glue surrounds them and however
+# the stream is chunked. Contiguous card numbers glued to *digits* are excluded by design: an unseparated
+# run inside a longer number is treated as an id (documented in the README's known-misses list).
+ORACLE_PII = {
+    "email": ["jane.doe@example.com", "j+tag@sub.mail.example.co.uk", "x_y@ex-ample.io"],
+    "ssn": ["123-45-6789", "321 54 9876", "555.12.3456"],
+    "card_grouped": ["4111 1111 1111 1111", "5555-5555-5555-4444", "3782 822463 10005", "6011.1111.1111.1117"],
+    "card_plain": ["4111111111111111", "378282246310005"],
+}
+GLUE = ["", " ", ",", ".", "-", ":", "(", ")", "\n", "x", "Z", "9", "_", "é", "😀", '"']
+
+
+@pytest.mark.parametrize("seed", range(250))
+def test_ground_truth_oracle_no_injected_pii_survives(seed):
+    rnd = random.Random(10_000 + seed)
+    parts, injected = [], []
+    for _ in range(rnd.randint(3, 8)):
+        kind = rnd.choice(list(ORACLE_PII))
+        pii = rnd.choice(ORACLE_PII[kind])
+        before, after = rnd.choice(GLUE), rnd.choice(GLUE)
+        if kind == "card_plain":
+            before = before if not before.isdigit() else " "
+            after = after if not after.isdigit() else " "
+        if kind == "email" and (before in "._-" or before.isalnum() or before == "é"):
+            before = " "  # would legitimately extend the local part; the email is still redacted, just longer
+        parts.append(f"{rnd.choice(FILLER)} {before}{pii}{after} {rnd.choice(FILLER)}")
+        injected.append(pii)
+    text = " ".join(parts)
+    sizes = [rnd.choice([1, 2, 3, 5, 8, 13]) for _ in range(len(text))]
+    got, _ = _stream(text, sizes)
+    for pii in injected:
+        assert pii not in got, (pii, text, got)
+
+
+def test_heartbeat_keeps_idle_stream_alive():
+    """Upstream silent for 1.2 s before its first token -> client sees ': ping' comments, then content."""
+    mock_app, _ = build_mock()
+    with run_uvicorn(mock_app) as m, run_uvicorn(create_app(GuardSettings(f"{m}/v1", heartbeat_s=0.3))) as gw:
+        body = {"stream": True, "messages": [{"role": "user", "content": "hi jane@x.org"}], "mock_ttft_ms": 1200}
+        text = httpx.post(f"{gw}/v1/chat/completions", json=body, timeout=10).text
+    assert text.count(": ping") >= 2
+    assert text.index(": ping") < text.index('"content"')
+    assert "jane@x.org" not in text and _events(text)[-1] == "[DONE]"

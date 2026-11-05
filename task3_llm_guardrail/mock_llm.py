@@ -43,19 +43,45 @@ def build() -> tuple[FastAPI, dict[str, Any]]:
         text = next((m["content"] for m in reversed(body["messages"]) if m.get("role") == "user"), "")
         mode = body.get("mock_mode", "content")
         n = int(body.get("n", 1))
-        base = {"id": "chatcmpl-mock", "object": "chat.completion.chunk", "created": int(time.time()), "model": body.get("model", "mock-1")}
+        base = {
+            "id": "chatcmpl-mock",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": body.get("model", "mock-1"),
+        }
 
         if not body.get("stream"):
             msg: dict[str, Any] = {"role": "assistant", "content": text}
             if mode == "tool_call":
-                msg = {"role": "assistant", "content": None, "tool_calls": [
-                    {"id": "call_1", "type": "function", "function": {"name": "send_email", "arguments": json.dumps({"body": text})}}
-                ]}
-            return JSONResponse({**base, "object": "chat.completion", "choices": [
-                {"index": i, "message": msg, "finish_reason": "stop"} for i in range(n)
-            ], "usage": {"prompt_tokens": 5, "completion_tokens": len(text) // 4, "total_tokens": 5 + len(text) // 4}})
+                msg = {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "send_email", "arguments": json.dumps({"body": text})},
+                        }
+                    ],
+                }
+            return JSONResponse(
+                {
+                    **base,
+                    "object": "chat.completion",
+                    "choices": [{"index": i, "message": msg, "finish_reason": "stop"} for i in range(n)],
+                    "usage": {
+                        "prompt_tokens": 5,
+                        "completion_tokens": len(text) // 4,
+                        "total_tokens": 5 + len(text) // 4,
+                    },
+                }
+            )
 
-        pieces = _chunks(text if mode != "tool_call" else json.dumps({"body": text}), body.get("mock_chunk_max", 6), body.get("mock_seed", 0))
+        pieces = _chunks(
+            text if mode != "tool_call" else json.dumps({"body": text}),
+            body.get("mock_chunk_max", 6),
+            body.get("mock_seed", 0),
+        )
         delay = body.get("mock_delay_ms", 0) / 1000
         ttft = body.get("mock_ttft_ms", 0) / 1000
 
@@ -69,13 +95,24 @@ def build() -> tuple[FastAPI, dict[str, Any]]:
                 for i in range(n):
                     first = {"role": "assistant", "content": ""}
                     if mode == "tool_call":
-                        first = {"role": "assistant", "content": None, "tool_calls": [
-                            {"index": 0, "id": "call_1", "type": "function", "function": {"name": "send_email", "arguments": ""}}
-                        ]}
+                        first = {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "send_email", "arguments": ""},
+                                }
+                            ],
+                        }
                     yield frame({**base, "choices": [{"index": i, "delta": first, "finish_reason": None}]})
                 for k, piece in enumerate(pieces):
                     if mode == "error_midstream" and k == len(pieces) // 2:
-                        yield frame({"error": {"message": "internal: shard 7 OOM at /srv/model.py:42", "type": "server_error"}})
+                        yield frame(
+                            {"error": {"message": "internal: shard 7 OOM at /srv/model.py:42", "type": "server_error"}}
+                        )
                         return
                     for i in range(n):
                         if mode == "tool_call":
@@ -84,12 +121,25 @@ def build() -> tuple[FastAPI, dict[str, Any]]:
                             delta = {"content": piece}
                         choice: dict[str, Any] = {"index": i, "delta": delta, "finish_reason": None}
                         if mode == "logprobs":
-                            choice["logprobs"] = {"content": [{"token": piece, "logprob": -0.1, "bytes": list(piece.encode())}]}
+                            choice["logprobs"] = {
+                                "content": [{"token": piece, "logprob": -0.1, "bytes": list(piece.encode())}]
+                            }
                         yield frame({**base, "choices": [choice]})
                     if delay:
                         await asyncio.sleep(delay)
                 for i in range(n):
-                    yield frame({**base, "choices": [{"index": i, "delta": {}, "finish_reason": "tool_calls" if mode == "tool_call" else "stop"}]})
+                    yield frame(
+                        {
+                            **base,
+                            "choices": [
+                                {
+                                    "index": i,
+                                    "delta": {},
+                                    "finish_reason": "tool_calls" if mode == "tool_call" else "stop",
+                                }
+                            ],
+                        }
+                    )
                 if mode == "no_done":
                     return
                 yield b"data: [DONE]\n\n"
@@ -99,6 +149,11 @@ def build() -> tuple[FastAPI, dict[str, Any]]:
                 raise
 
         return StreamingResponse(gen(), media_type="text/event-stream")
+
+    @app.get("/_mock/stats")
+    async def stats() -> dict[str, Any]:
+        """How many requests the provider actually received / completed / saw cancelled."""
+        return state
 
     return app, state
 
